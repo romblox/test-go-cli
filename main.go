@@ -1,77 +1,94 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"net/http"
-	"os"
-	"strconv"
+	"net/url"
+	"sync"
 	"time"
 )
 
-func QueryWebsite(url string, success chan<- time.Duration, failure chan<- bool) {
-	start := time.Now()
-	_, err := http.Get(url)
-	if err != nil {
-		failure <- true
-		return
-	}
-	//defer resp.Body.Close()
-	success <- time.Since(start)
-}
-
 func main() {
-	if len(os.Args) != 4 {
-		fmt.Println("Usage: go run main.go <url> <number of requests> <timeout>")
+	var (
+		longestQuery     time.Duration
+		shortestQuery    time.Duration
+		totalQueryTime   time.Duration
+		successfulReqs   int
+		unsuccessfulReqs int
+	)
+
+	urlStr := flag.String("url", "", "URL to query")
+	numThreads := flag.Int("threads", 1, "Number of concurrent threads")
+	timeout := flag.Int("timeout", 0, "Timeout in seconds (optional)")
+	flag.Parse()
+
+	// Validate URL format
+	parsedURL, err := url.Parse(*urlStr)
+	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		fmt.Println("Please provide a valid URL.")
 		return
 	}
 
-	url := os.Args[1]
-
-	numRequests, err := strconv.Atoi(os.Args[2])
-	if err != nil {
-		panic(err)
+	// Validate number of concurrent threads
+	if *numThreads <= 0 {
+		fmt.Println("Number of concurrent threads must be > 0")
+		return
 	}
 
-	timeout, err := strconv.Atoi(os.Args[3])
-	if err != nil {
-		panic(err)
-	}
+	// Create a wait group to wait for all goroutines to finish
+	var wg sync.WaitGroup
 
-	success := make(chan time.Duration, numRequests)
-	failure := make(chan bool, numRequests)
+	// Create a channel to collect query times
+	queryTimes := make(chan time.Duration, *numThreads)
 
-	start := time.Now()
+	// Start goroutines for concurrent requests
+	wg.Add(*numThreads)
+	for i := 0; i < *numThreads; i++ {
+		go func() {
+			defer wg.Done()
+			startTime := time.Now()
 
-	for i := 0; i < numRequests; i++ {
-		go QueryWebsite(url, success, failure)
-	}
-
-	var total time.Duration
-	var min = time.Duration(timeout) * time.Second
-	var max time.Duration
-	fails := 0
-
-	for i := 0; i < numRequests; i++ {
-		select {
-		case s := <-success:
-			if min > s {
-				min = s
+			// Create an HTTP client with custom timeout
+			client := &http.Client{
+				Timeout: time.Duration(*timeout) * time.Second,
 			}
-			if max < s {
-				max = s
+
+			// Make an HTTP request
+			_, err := client.Get(*urlStr)
+			if err != nil {
+				fmt.Println("Error:", err)
+				unsuccessfulReqs++
+				return
 			}
-			total += s
-		case <-failure:
-			fails++
-		case <-time.After(time.Duration(timeout) * time.Second):
-			fmt.Println("Timeout")
-			fails++
-		}
+
+			// Calculate query time
+			queryTime := time.Since(startTime)
+			queryTimes <- queryTime
+
+			// Update statistics
+			if queryTime > longestQuery {
+				longestQuery = queryTime
+			}
+			if queryTime < shortestQuery || shortestQuery == 0 {
+				shortestQuery = queryTime
+			}
+			totalQueryTime += queryTime
+			successfulReqs++
+		}()
 	}
 
-	fmt.Printf("Longest Query: %v\n", max)
-	fmt.Printf("Shortest Query: %v\n", min)
-	fmt.Printf("Average query: %v\n", total/(time.Duration(numRequests-fails)))
-	fmt.Printf("Unsuccessful requests: %d\n", fails)
-	fmt.Printf("Total time elapsed: %v\n", time.Since(start))
+	// Wait for all goroutines to finish
+	wg.Wait()
+	close(queryTimes)
+
+	// Calculate average query time
+	averageQueryTime := totalQueryTime / time.Duration(successfulReqs)
+
+	// Print statistics
+	fmt.Printf("Longest query time: %v\n", longestQuery)
+	fmt.Printf("Shortest query time: %v\n", shortestQuery)
+	fmt.Printf("Average query time: %v\n", averageQueryTime)
+	fmt.Printf("Number of successful requests: %d\n", successfulReqs)
+	fmt.Printf("Number of unsuccessful requests: %d\n", unsuccessfulReqs)
 }
